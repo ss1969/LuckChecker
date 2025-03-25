@@ -11,6 +11,7 @@ import re
 import argparse
 import colorama
 from colorama import Fore, Style
+from fnmatch import fnmatch
 
 colorama.init()
 
@@ -39,7 +40,7 @@ def print_error(message, line=None, line_number=None, additional_info=None):
     print()  # 空行，使错误信息更清晰
 
 # 处理预处理指令
-def process_preprocessor_directive(line, defined_macros, condition_stack, skip_current_level, line_number=None):
+def parse_config_preprocessor_directive(line, defined_macros, condition_stack, skip_current_level, line_number=None):
     # 去除#后的前导空格
     line_content = line[1:].lstrip()
 
@@ -194,17 +195,24 @@ def process_preprocessor_directive(line, defined_macros, condition_stack, skip_c
 
     return condition_stack, skip_current_level
 
-# 处理配置行
-def process_config_line(line, config, line_number, in_swap_block):
+# 处理配置文件某一行
+def parse_config_single_line(line, config, line_number, in_swap_block):
+    """处理配置文件某一行"""
+    # 如果行首是{，说明是Swap块的开始
     if line.startswith('Swap = {'):
         if in_swap_block:
             print_error("大括号嵌套错误，已经在一个 Swap 块内", line, line_number)
             return config, in_swap_block, True  # 错误标志
         return config, True, False  # 进入Swap块，无错误
-
-    if line == '}' and in_swap_block:
+        
+    # 如果行首是}，说明是Swap块的结束
+    if line == '}':
+        if not in_swap_block:
+            print_error("发现未配对的结束大括号 '}'", line, line_number)
+            return config, in_swap_block, True  # 错误标志
         return config, False, False  # 退出Swap块，无错误
-
+        
+    # 如果行首是typedef，说明是类型定义
     if line.startswith('typedef '):
         if not in_swap_block:
             print_error("typedef 必须在 Swap = { } 块内", line, line_number)
@@ -213,45 +221,77 @@ def process_config_line(line, config, line_number, in_swap_block):
             config['Swap'] = line
         else:
             config['Swap'] += ',' + line
-    elif '=' in line:
+        return config, in_swap_block, False
+        
+    # 如果行包含=，说明是键值对配置
+    if '=' in line:
         key, value = map(str.strip, line.split('=', 1))
         # 处理行尾可能的逗号
         if value and value[-1] == ',':
             value = value[:-1].strip()
 
-        # 对于Folder、Files和Swap键，追加到已有值
-        if key in ['Folder', 'Files', 'Swap']:
+        # 对于Folder、Files、ExcludeFile和Swap键，追加到已有值
+        if key in ['Folder', 'Files', 'Swap', 'ExcludeFile', 'ExcludeHeading']:
             if key not in config:
                 config[key] = value
             else:
-                config[key] += ',' + value
+                # 如果已经有值，添加逗号分隔符
+                if config[key]:
+                    config[key] += ',' + value
+                else:
+                    config[key] = value
         else:
             config[key] = value
-
-    return config, in_swap_block, False  # 无错误
+        return config, in_swap_block, False
+        
+    # 如果行不为空但不符合任何已知格式，报错
+    if line:
+        print_error("无效的配置行格式", line, line_number)
+        return config, in_swap_block, True  # 错误标志
+        
+    return config, in_swap_block, False  # 空行，无错误
 
 # 解析文件夹列表
-def parse_folders(config):
+def parse_config_folders(config):
     folders = []
     if 'Folder' in config:
         for folder_path in config['Folder'].split(','):
             folder_path = folder_path.strip()
+            # 去除两边的引号（如果有）
+            if folder_path.startswith('"') and folder_path.endswith('"'):
+                folder_path = folder_path[1:-1]
+            elif folder_path.startswith("'") and folder_path.endswith("'"):
+                folder_path = folder_path[1:-1]
             if folder_path and folder_path not in folders:
                 folders.append(folder_path)
     return folders
 
 # 解析文件类型列表
-def parse_files(config):
+def parse_config_files(config):
     files = []
+    exclude_files = []
+    
     if 'Files' in config:
-        for file_ext in config['Files'].split(','):
-            file_ext = file_ext.strip()
-            if file_ext and file_ext not in files:
-                files.append(file_ext)
-    return files
+        for pattern in config['Files'].split(','):
+            pattern = pattern.strip()
+            if pattern and pattern not in files:
+                files.append(pattern)
+                
+    if 'ExcludeFile' in config:
+        for pattern in config['ExcludeFile'].split(','):
+            pattern = pattern.strip()
+            # 去除两边的引号（如果有）
+            if pattern.startswith('"') and pattern.endswith('"'):
+                pattern = pattern[1:-1]
+            elif pattern.startswith("'") and pattern.endswith("'"):
+                pattern = pattern[1:-1]
+            if pattern and pattern not in exclude_files:
+                exclude_files.append(pattern)
+                
+    return files, exclude_files
 
 # 处理typedef格式的替换规则
-def process_typedef_swap(part):
+def parse_config_swap_typedef(part):
     # 移除注释部分
     if '/*' in part:
         part = part[:part.find('/*')].strip()
@@ -268,7 +308,7 @@ def process_typedef_swap(part):
     return None
 
 # 解析替换规则
-def parse_swaps(config, line_map=None):
+def parse_config_swaps(config, line_map=None):
     swaps = []
     source_set = set()  # 用于检测重复的源类型
 
@@ -288,7 +328,7 @@ def parse_swaps(config, line_map=None):
 
             # 处理typedef格式
             if part.startswith('typedef '):
-                swap_pair = process_typedef_swap(part)
+                swap_pair = parse_config_swap_typedef(part)
                 if swap_pair:
                     pairs.append((swap_pair, part))  # 添加源代码用于错误提示
             else:
@@ -330,147 +370,84 @@ def parse_swaps(config, line_map=None):
 
     return swaps
 
-# 解析配置文件
-def parse_config(config_path):
-    config = {}
-    # 跟踪每行内容的行号（用于错误提示）
-    line_map = {}
+# 解析排除前置标记列表
+def parse_config_exclude_heading(config):
+    """解析需要排除的前置标记列表"""
+    exclude_heading = []
+    if 'ExcludeHeading' in config:
+        for heading in config['ExcludeHeading'].split(','):
+            heading = heading.strip()
+            # 去除两边的引号（如果有）
+            if heading.startswith('"') and heading.endswith('"'):
+                heading = heading[1:-1]
+            elif heading.startswith("'") and heading.endswith("'"):
+                heading = heading[1:-1]
+            if heading and heading not in exclude_heading:
+                exclude_heading.append(heading)
+    return exclude_heading
 
+# 解析配置文件
+def parse_config(config_file):
+    """解析配置文件"""
+    config = {}
+    in_swap_block = False
+    has_error = False
+    
     # 预定义宏
     defined_macros = {}
-
+    
     # 条件指令状态栈
     condition_stack = []  # 存储当前条件指令的求值结果
     skip_current_level = False  # 是否跳过当前级别
-
-    # Swap块状态
-    in_swap_block = False
-
-    # 记录最后一行行号，用于未闭合块错误提示
-    last_line_number = 0
-
-    # 有效的预处理指令关键字
-    valid_preprocessor_keywords = ['ifdef', 'ifndef', 'if', 'elif', 'else', 'endif', 'define']
-
+    
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with open(config_file, 'r', encoding='utf-8') as f:
             for line_number, line in enumerate(f, 1):
-                last_line_number = line_number
-                # 保存原始行内容
-                original_line = line.strip()
-                # 保存每行内容对应的行号
-                if original_line:
-                    line_map[original_line] = line_number
-
-                # 处理可能有前导空格的预处理指令
-                if original_line and original_line.lstrip().startswith('#'):
-                    # 提取预处理指令（去除前导空格）
-                    preprocessor_line = original_line.lstrip()
-
-                    # 验证预处理指令的有效性
-                    is_valid = False
-
-                    # 允许#和关键字之间有空格
-                    preprocessor_parts = preprocessor_line[1:].lstrip().split(None, 1)
-                    if preprocessor_parts:
-                        first_keyword = preprocessor_parts[0]
-                        if first_keyword in valid_preprocessor_keywords:
-                            is_valid = True
-
-                    # 如果预处理指令无效，报错
-                    if not is_valid:
-                        first_word = preprocessor_line.split(None, 1)[0][1:] if ' ' in preprocessor_line else preprocessor_line[1:]
-                        print_error(
-                            f"无效的预处理指令 '{first_word}'",
-                            original_line,
-                            line_number,
-                            f"有效的预处理指令关键字: {', '.join(valid_preprocessor_keywords)}"
-                        )
-                        return [], [], []
-
-                    # 处理预处理器指令
-                    try:
-                        condition_stack, skip_current_level = process_preprocessor_directive(
-                            preprocessor_line, defined_macros, condition_stack, skip_current_level, line_number
-                        )
-                    except Exception as e:
-                        print_error(
-                            "处理预处理指令时出错",
-                            original_line,
-                            line_number,
-                            str(e)
-                        )
-                        return [], [], []
+                # 去除行首空格和行尾换行符
+                line = line.strip()
+                
+                # 跳过空行和注释行
+                if not line or line.startswith('//') or line.startswith('/*'):
                     continue
-                # 忽略空行和注释行（// 或 /* 开头）
-                elif (not original_line or
-                      original_line.lstrip().startswith('//') or
-                      original_line.lstrip().startswith('/*')):
+                    
+                # 处理预处理指令
+                if line.startswith('#'):
+                    condition_stack, skip_current_level = parse_config_preprocessor_directive(
+                        line, defined_macros, condition_stack, skip_current_level, line_number
+                    )
                     continue
-
+                    
                 # 如果当前在跳过的条件块内，则跳过此行
                 if skip_current_level:
                     continue
-
-                # 正常处理配置行
-                config, in_swap_block, has_error = process_config_line(original_line, config, line_number, in_swap_block)
-                if has_error:
-                    print_error("配置文件解析中断，请修复错误后重试", original_line, line_number)
-                    return [], [], []
+                    
+                # 处理配置行
+                config, in_swap_block, line_error = parse_config_single_line(line, config, line_number, in_swap_block)
+                if line_error:
+                    has_error = True
+                    
+        # 检查是否有未闭合的Swap块
+        if in_swap_block:
+            print_error("配置文件末尾缺少结束大括号 '}'", "", line_number)
+            has_error = True
+            
+        # 检查是否有未闭合的条件指令
+        if condition_stack:
+            print_error(f"配置文件中有{len(condition_stack)}个未闭合的条件指令", "", line_number)
+            has_error = True
+            
+        if has_error:
+            print(f"{RED}配置文件解析失败，请检查上述错误{RESET}")
+            return None
+            
+        return config
+        
     except Exception as e:
-        print_error(f"配置文件解析错误", None, last_line_number, str(e))
-        return [], [], []
-
-    # 检查是否有未闭合的块
-    if in_swap_block:
-        print_error("配置文件中有未闭合的 Swap 块，缺少结束大括号 '}'", None, last_line_number)
-        return [], [], []
-
-    # 检查是否有未闭合的条件指令
-    if condition_stack:
-        print_error(f"配置文件中有{len(condition_stack)}个未闭合的条件指令", None, last_line_number)
-
-    # 解析各部分配置
-    folders = parse_folders(config)
-    files = parse_files(config)
-    swaps = parse_swaps(config, line_map)
-
-    return folders, files, swaps
-
-# 打印替换信息
-def print_replace_info(filename, line_num, pre, original, post, dest):
-    # 处理字符串中的换行符
-    pre = pre.replace('\n', '\\n').lstrip()
-    original = original.replace('\n', '\\n')
-    post = post.replace('\n', '\\n')
-    dest = dest.replace('\n', '\\n')
-
-    # 计算显示内容 - 直接使用颜色而不包含在格式化字符串中
-    original_colored = f"{pre}{RED}{original}{RESET}{GRAY}{post}{RESET}"
-    new_colored = f"{pre}{GREEN}{dest}{RESET}{GRAY}{post}{RESET}"
-
-    # 构建前缀（文件名和行号）
-    if filename and line_num:
-        # 行号以4位显示，不足补0
-        line_num_str = f"{line_num:04d}"
-        prefix = f"LINE {line_num_str}:  "
-    else:
-        # 使用空格对齐后续行
-        prefix = " " * 12  # 根据"LINE 0000: "的长度调整
-
-    # 不要在格式化宽度中包含颜色控制字符，先计算显示长度
-    # 计算不含颜色控制字符的显示长度
-    visible_len = len(pre) + len(original) + len(post)
-
-    # 不使用格式化宽度，而是手动计算和添加空格
-    padding = max(0, 40 - visible_len)
-    spacing = " " * padding
-
-    # 打印最终结果
-    print(f"{prefix}{GRAY}{original_colored}{spacing} →     {new_colored}")
+        print(f"{RED}读取配置文件失败: {str(e)}{RESET}")
+        return None
 
 # 处理文件
-def collect_replacements(original_lines, swaps):
+def collect_replacements(original_lines, swaps, exclude_heading):
     """收集文件中的所有替换位置"""
     replacements_by_line = []
     total_replacements = 0
@@ -481,6 +458,15 @@ def collect_replacements(original_lines, swaps):
         # 用于跟踪已经处理过的位置区间
         processed_ranges = []
 
+        # 检查当前行是否包含排除的前置标记
+        exclude_heading_pos = -1
+        if exclude_heading:
+            for heading in exclude_heading:
+                pos = orig_line.find(heading)
+                if pos != -1:
+                    exclude_heading_pos = pos
+                    break
+
         # 收集这一行的所有替换
         for src, dest in swaps:  # swaps已经是排序后的规则
             # 修改正则表达式，确保匹配完整的独立单词
@@ -489,6 +475,10 @@ def collect_replacements(original_lines, swaps):
             # 查找所有匹配，但避免在已替换的位置上再次替换
             for match in pattern.finditer(orig_line):
                 start, end = match.start(), match.end()
+
+                # 如果这个替换位置在排除前置标记之后，则跳过
+                if exclude_heading_pos != -1 and start > exclude_heading_pos:
+                    continue
 
                 # 检查这个范围是否已经被处理过
                 overlap = False
@@ -534,7 +524,7 @@ def display_replacements(filepath, replacements_by_line):
 
         # 构建前缀（行号）
         line_num_str = f"{line_idx + 1:04d}"
-        prefix = f"LINE {line_num_str}:  "
+        prefix = f"{GRAY}LINE {line_num_str}:{RESET}  "
 
         # 创建原始行，不包含任何着色
         old_line = original_line
@@ -597,7 +587,7 @@ def display_replacements(filepath, replacements_by_line):
 
         # 打印旧行和新行
         print(f"{prefix}{colored_old_line}")
-        print(f"{' ' * (len(prefix) - 3)}→  {colored_new_line}")
+        print(f"{' ' * (len(prefix) - 12)}→  {colored_new_line}")
 
 def apply_replacements(original_lines, swaps):
     """应用替换到文件内容"""
@@ -617,16 +607,91 @@ def apply_replacements(original_lines, swaps):
 
     return modified, modified_lines
 
-def process_file(filepath, swaps, apply_changes):
+def find_pointer_definitions(filepath):
+    """查找文件中的指针变量定义"""
+    pointer_definitions = []
+    
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        for line_idx, line in enumerate(lines, 1):
+            # 跳过空行和注释行
+            line = line.strip()
+            if not line or line.startswith('//') or line.startswith('/*'):
+                continue
+                
+            # 排除明显不是变量定义的行
+            if '(' in line and ')' in line and '*' in line and line.index('(') < line.index('*'):
+                # 可能是函数声明或定义，跳过
+                continue
+                
+            # 查找指针定义的模式
+            # 1. 基本指针变量: 类型 [const] *[const] 变量名 [= 初始值];
+            # 2. 数组指针变量: 类型 [const] *[const] 变量名[] [= 初始值];
+            # 3. 成员指针变量: 类型 类名::*变量名 [= 初始值];
+            
+            # 基本指针变量模式 - 使用\s+和\s*匹配多个空格或Tab
+            basic_ptr_pattern = r'((?:const\s+)?(?:\w+)(?:::\w+)?(?:\s+const)?\s*\*+\s*(?:const\s+)?\s*(\w+))(?:\s*=\s*[^;]+)?;'
+            
+            # 数组指针变量模式 - 同样使用\s+和\s*匹配多个空格或Tab
+            array_ptr_pattern = r'((?:const\s+)?(?:\w+)(?:::\w+)?(?:\s+const)?\s*\*+\s*(?:const\s+)?\s*(\w+)\s*\[\])(?:\s*=\s*[^;]+)?;'
+            
+            # 成员指针变量模式 - 同样使用\s+和\s*匹配多个空格或Tab
+            member_ptr_pattern = r'((?:const\s+)?(?:\w+)\s+(\w+)::\*\s*(\w+))(?:\s*=\s*[^;]+)?;'
+            
+            # 查找所有匹配
+            for pattern_name, pattern in [
+                ("基本指针", basic_ptr_pattern),
+                ("数组指针", array_ptr_pattern),
+                ("成员指针", member_ptr_pattern)
+            ]:
+                for match in re.finditer(pattern, line):
+                    if pattern_name == "基本指针" or pattern_name == "数组指针":
+                        ptr_type = match.group(1)
+                        ptr_name = match.group(2)
+                    else:  # 成员指针
+                        ptr_type = match.group(1)
+                        class_name = match.group(2)
+                        ptr_name = match.group(3)
+                    
+                    pointer_definitions.append((line_idx, ptr_type, pattern_name, line))
+            
+    except Exception as e:
+        print(f"{RED}读取文件失败 {filepath}: {str(e)}{RESET}")
+        
+    return pointer_definitions
+
+def display_pointer_definitions(filepath, definitions):
+    """显示指针定义"""
+    if not definitions:
+        print(f"{GRAY}未找到指针定义{RESET}")
+        return
+        
+    print(f"\n{CYAN}===== 指针定义列表 ====={RESET}")
+    for line_idx, pointer_type, pointer_category, line in definitions:
+        print(f"{GREEN}[{line_idx:4d}] {RESET}{RED}{pointer_type}{RESET} ({pointer_category})")
+        print(f"      {line}")
+    print(f"{CYAN}======================{RESET}\n")
+
+def process_single_file(filepath, swaps, apply_changes, exclude_heading):
     """处理单个文件的替换操作"""
     with open(filepath, 'r', encoding='utf-8') as f:
         original_lines = f.readlines()
 
     # 收集替换位置
-    replacements_by_line, total_replacements = collect_replacements(original_lines, swaps)
+    replacements_by_line, total_replacements = collect_replacements(original_lines, swaps, exclude_heading)
 
     # 显示替换位置
     display_replacements(filepath, replacements_by_line)
+    
+    # 如果没有找到替换项目，显示提示信息
+    if total_replacements == 0:
+        print(f"{GRAY}没有查找到可替换项目{RESET}")
+
+    # 查找并显示指针定义
+    pointer_definitions = find_pointer_definitions(filepath)
+    display_pointer_definitions(filepath, pointer_definitions)
 
     # 实际替换阶段
     if apply_changes and total_replacements > 0:
@@ -639,11 +704,15 @@ def process_file(filepath, swaps, apply_changes):
     return total_replacements
 
 # 显示配置信息并根据配置模式决定是否继续执行
-def show_configuration(folders, files, swaps, config_only):
+def show_configuration(folders, files, exclude_files, swaps, config_only, exclude_heading):
     """显示程序配置信息，并根据配置模式决定是否继续执行"""
-    print(f"{CYAN}===== 幸替换运工具 ====={RESET}")
+    print(f"{CYAN}===== 幸运检查工具 ====={RESET}")
     print(f"{GREEN}搜索目录: {RESET}{', '.join(folders)}")
-    print(f"{GREEN}文件类型: {RESET}{', '.join(files)}")
+    print(f"{GREEN}文件匹配: {RESET}{', '.join(files)}")
+    if exclude_files:
+        print(f"{GREEN}排除文件: {RESET}{', '.join(exclude_files)}")
+    if exclude_heading:
+        print(f"{GREEN}跳过包含: {RESET}{', '.join(exclude_heading)}")
     if config_only:
         print(f"{GREEN}替换规则: {RESET}")
         # 找出最长的src长度
@@ -657,51 +726,70 @@ def show_configuration(folders, files, swaps, config_only):
     print(f"{GREEN}替换规则: {RESET}{len(swaps)} 条")
     return True
 
-# 检查配置有效性
-def check_config(folders, files, swaps):
-    """检查配置的有效性"""
-    if not folders:
-        print_error("未指定搜索目录", None, 1)  # 假设在配置文件开始处检查
-        return False
+# 收集目标文件列表
+def collect_target_files(folders, files, exclude_files):
+    """收集所有需要处理的文件列表"""
+    # 首先收集所有匹配的文件
+    matched_files = []
 
-    if not files:
-        print_error("未指定文件类型", None, 1)  # 假设在配置文件开始处检查
-        return False
-
-    if not swaps:
-        print_error("未指定替换规则或替换规则存在错误", None, 1)  # 假设在配置文件开始处检查
-        return False
-
-    # 检查目录是否存在
-    missing_folders = [f for f in folders if not os.path.exists(f)]
-    if missing_folders:
-        print_error(f"目录不存在", None, 1, f"找不到目录: {', '.join(missing_folders)}")  # 假设在配置文件开始处检查
-        return False
-
-    return True
-
-# 查找并处理匹配文件
-def process_matching_files(folders, files, swaps, apply_changes):
-    """查找并处理所有匹配的文件"""
-    total = 0
-    processed_files = 0
-
-    # 遍历所有目录
     for folder in folders:
         for root, _, filenames in os.walk(folder):
             for filename in filenames:
-                if any(filename.endswith(ext) for ext in files):
-                    filepath = os.path.join(root, filename)
-                    abs_path = os.path.abspath(filepath)
+                # 检查是否匹配包含模式
+                for pattern in files:
+                    if pattern and fnmatch(filename, pattern.strip()):
+                        filepath = os.path.join(root, filename)
+                        matched_files.append(filepath)
+                        break
+    
+    # 从匹配文件中排除不需要的文件
+    if exclude_files:
+        filtered_files = []
+        for filepath in matched_files:
+            filename = os.path.basename(filepath)
+            exclude = False
+            for pattern in exclude_files:
+                if pattern and fnmatch(filename, pattern.strip()):
+                    exclude = True
+                    break
+            if not exclude:
+                filtered_files.append(filepath)
+        matched_files = filtered_files
 
-                    separator = "-" * 80
-                    print(f"\n{YELLOW}{separator}{RESET}")
-                    print(f"{YELLOW}处理文件: {abs_path}{RESET}")
-                    print(f"{YELLOW}{separator}{RESET}")
+    print(f"\n{CYAN}===== 待处理文件文件列表 ====={RESET}")
+    for i, filepath in enumerate(matched_files, 1):
+        print(f"{GREEN}[{i:3d}] {RESET}{filepath}")
+    print(f"{CYAN}======================{RESET}\n")
 
-                    count = process_file(filepath, swaps, apply_changes)
-                    total += count
-                    processed_files += 1
+    return matched_files
+
+# 查找并处理匹配文件
+def process_matching_files(target_files, swaps, apply_changes, file_number=None, exclude_heading=None):
+    """处理所有匹配的文件"""
+    total = 0
+    processed_files = 0
+    current_file_index = 0
+
+    # 处理文件列表
+    for filepath in target_files:
+        current_file_index += 1
+        # 如果指定了文件序号且当前文件不是目标文件，则跳过
+        if file_number is not None and current_file_index != file_number:
+            continue
+
+        abs_path = os.path.abspath(filepath)
+        separator = "-" * 120
+        print(f"{YELLOW}{separator}{RESET}")
+        print(f"{YELLOW}处理文件 [{current_file_index}]: {abs_path}{RESET}")
+        print(f"{YELLOW}{separator}{RESET}")
+
+        count = process_single_file(filepath, swaps, apply_changes, exclude_heading)
+        total += count
+        processed_files += 1
+
+        # 如果指定了文件序号且已处理完目标文件，则提前结束
+        if file_number is not None and current_file_index == file_number:
+            return total, processed_files
 
     return total, processed_files
 
@@ -715,31 +803,102 @@ def display_results(total, processed_files, apply_changes):
     if not apply_changes:
         print("\n（本次仅为预览，添加-y参数实际执行修改）")
 
+# 检查配置有效性
+def check_config(folders, files, swaps):
+    """检查配置的有效性"""
+    if not folders:
+        print_error("未指定搜索目录", None, 1)
+        return False
+
+    if not files:
+        print_error("未指定文件类型", None, 1)
+        return False
+
+    if not swaps:
+        print_error("未指定替换规则或替换规则存在错误", None, 1)
+        return False
+
+    # 检查目录是否存在
+    missing_folders = [f for f in folders if not os.path.exists(f)]
+    if missing_folders:
+        print_error(f"目录不存在", None, 1, f"找不到目录: {', '.join(missing_folders)}")
+        return False
+
+    return True
+
+def process_pointers_only(target_files, file_number=None):
+    """只处理指针定义，不进行替换操作"""
+    current_file_index = 0
+    processed_files = 0
+    total_pointers = 0
+
+    # 处理文件列表
+    for filepath in target_files:
+        current_file_index += 1
+        # 如果指定了文件序号且当前文件不是目标文件，则跳过
+        if file_number is not None and file_number > 0 and current_file_index != file_number:
+            continue
+
+        abs_path = os.path.abspath(filepath)
+        separator = "-" * 120
+        print(f"{YELLOW}{separator}{RESET}")
+        print(f"{YELLOW}分析文件 [{current_file_index}]: {abs_path}{RESET}")
+        print(f"{YELLOW}{separator}{RESET}")
+
+        # 查找并显示指针定义
+        pointer_definitions = find_pointer_definitions(filepath)
+        display_pointer_definitions(filepath, pointer_definitions)
+        total_pointers += len(pointer_definitions)
+        processed_files += 1
+
+        # 如果指定了文件序号且已处理完目标文件，则提前结束
+        if file_number is not None and file_number > 0 and current_file_index == file_number:
+            break
+
+    # 显示处理结果
+    print(f"\n{CYAN}===== 指针分析结果 ====={RESET}")
+    print(f"总共找到 {total_pointers} 个指针定义")
+    print(f"{GREEN}{processed_files} 个文件已处理{RESET}")
+    print(f"{CYAN}======================{RESET}\n")
+
 # 主函数
 def main():
-    parser = argparse.ArgumentParser(description='幸替换运工具', prefix_chars='-/')
-    parser.add_argument('-y', '--yes', dest='apply_changes', action='store_true',
-                      help='实际执行文件修改（不加此参数仅显示预览）')
+    parser = argparse.ArgumentParser(description='幸运检查工具', prefix_chars='-/')
+    parser.add_argument('-y', '--yes', nargs='?', const=0, type=int, dest='file_number',
+                      help='实际执行文件修改。如果指定数字，则只处理该序号的文件（从1开始）')
     parser.add_argument('-c', '--config', dest='config_only', action='store_true',
                       help='只显示配置信息，不执行任何文件操作')
+    parser.add_argument('-i', '--indicator', dest='pointer_only', action='store_true',
+                      help='只显示指针定义，不处理替换项目')
     args = parser.parse_args()
 
     # 解析配置文件
-    folders, files, swaps = parse_config('config.ini')
+    config = parse_config('config.ini')
 
     # 检查配置有效性
-    if not check_config(folders, files, swaps):
+    if not check_config(parse_config_folders(config), parse_config_files(config)[0], parse_config_swaps(config)):
         return
 
     # 显示配置信息并决定是否继续执行
-    if not show_configuration(folders, files, swaps, args.config_only):
+    if not show_configuration(parse_config_folders(config), parse_config_files(config)[0], parse_config_files(config)[1], parse_config_swaps(config), args.config_only, parse_config_exclude_heading(config)):
+        return
+
+    # 收集目标文件列表
+    target_files = collect_target_files(parse_config_folders(config), parse_config_files(config)[0], parse_config_files(config)[1])
+
+    # 如果是只显示指针模式，则只显示指针定义，不处理替换
+    if args.pointer_only:
+        process_pointers_only(target_files, args.file_number)
         return
 
     # 处理匹配的文件
-    total, processed_files = process_matching_files(folders, files, swaps, args.apply_changes)
+    apply_changes = args.file_number is not None
+    target_file_number = args.file_number if args.file_number and args.file_number > 0 else None
+    
+    total, processed_files = process_matching_files(target_files, parse_config_swaps(config), apply_changes, target_file_number, parse_config_exclude_heading(config))
 
     # 显示处理结果
-    display_results(total, processed_files, args.apply_changes)
+    display_results(total, processed_files, apply_changes)
 
 if __name__ == "__main__":
     main()
