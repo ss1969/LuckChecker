@@ -1,0 +1,3 @@
+new
+<new>
+operator new
