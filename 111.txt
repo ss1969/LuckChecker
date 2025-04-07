@@ -1,3 +1,4 @@
 new
 <new>
-operator new
+&operator new
+    Connection &operator=( const Connection & ) = delete;
