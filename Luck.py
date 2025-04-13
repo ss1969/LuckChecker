@@ -729,7 +729,7 @@ def process_single_file(filepath, swaps, apply_changes, exclude_heading, exclude
     return total_replacements
 
 # 显示配置信息并根据配置模式决定是否继续执行
-def show_configuration(folders, files, exclude_files, swaps, config_only, exclude_heading, exclude_pattern):
+def show_configuration(folders, files, exclude_files, swaps, show_cfg, exclude_heading, exclude_pattern):
     """显示程序配置信息，并根据配置模式决定是否继续执行"""
     print(f"{CYAN}===== 幸运检查工具 ====={RESET}")
     print(f"{GREEN}搜索目录: {RESET}{', '.join(folders)}")
@@ -740,7 +740,7 @@ def show_configuration(folders, files, exclude_files, swaps, config_only, exclud
         print(f"{GREEN}跳过包含: {RESET}{', '.join(exclude_heading)}")
     if exclude_pattern:
         print(f"{GREEN}跳过匹配: {RESET}{', '.join(exclude_pattern)}")
-    if config_only:
+    if show_cfg:
         print(f"{GREEN}替换规则: {RESET}")
         # 找出最长的src长度
         max_src_len = max(len(src) for src, _ in swaps) if swaps else 0
@@ -893,14 +893,16 @@ def main():
     parser = argparse.ArgumentParser(description='幸运检查工具', prefix_chars='-/')
     parser.add_argument('-y', '--yes', nargs='?', const=0, type=int, dest='file_number',
                       help='实际执行文件修改。如果指定数字，则只处理该序号的文件（从1开始）')
-    parser.add_argument('-c', '--config', dest='config_only', action='store_true',
+    parser.add_argument('-s', '--show', dest='show_cfg', action='store_true',
                       help='只显示配置信息，不执行任何文件操作')
     parser.add_argument('-i', '--indicator', dest='check_pointer', action='store_true',
                       help='检查指针定义')
+    parser.add_argument('-c', '--config', default='config.ini',
+                      help='指定配置文件路径，默认为config.ini')
     args = parser.parse_args()
 
     # 解析配置文件
-    config = parse_config('config.ini')
+    config = parse_config(args.config)
     if not config:
         return
 
@@ -916,11 +918,11 @@ def main():
         return
 
     # 显示配置信息并决定是否继续执行
-    if not show_configuration(folders, files, exclude_files, swaps, args.config_only, exclude_heading, exclude_pattern):
+    if not show_configuration(folders, files, exclude_files, swaps, args.show_cfg, exclude_heading, exclude_pattern):
         return
 
     # 如果只是显示配置，到这里就结束
-    if args.config_only:
+    if args.show_cfg:
         return
 
     # 获取所有匹配的文件
