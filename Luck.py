@@ -12,6 +12,7 @@ import argparse
 import colorama
 from colorama import Fore, Style
 from fnmatch import fnmatch
+from datetime import datetime
 
 colorama.init()
 
@@ -698,35 +699,112 @@ def display_pointer_definitions(filepath, definitions):
         print(f"      {line}")
     print(f"{CYAN}======================{RESET}\n")
 
-def process_single_file(filepath, swaps, apply_changes, exclude_heading, exclude_pattern, check_pointer=False):
-    """处理单个文件的替换操作"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        original_lines = f.readlines()
+def log_changes(filepath, replacements_by_line, original_lines, log_file):
+    """记录修改内容到日志文件"""
+    rel_path = os.path.relpath(filepath)
+    log_file.write(f"\n{'='*80}\n")
+    log_file.write(f"文件: {rel_path}\n")
+    log_file.write(f"{'='*80}\n\n")
 
-    # 收集替换位置
-    replacements_by_line, total_replacements = collect_replacements(original_lines, swaps, exclude_heading, exclude_pattern)
+    for line_idx, line_replacements in replacements_by_line:
+        # 获取原始行内容
+        original_line = original_lines[line_idx]
 
-    # 显示替换位置
-    display_replacements(filepath, replacements_by_line)
+        # 构建前缀（行号）
+        line_num_str = f"{line_idx + 1:04d}"
+        prefix = f"LINE {line_num_str}:  "
 
-    # 如果没有找到替换项目，显示提示信息
-    if total_replacements == 0:
-        print(f"{GRAY}没有查找到可替换项目{RESET}")
+        # 创建原始行，不包含任何着色
+        old_line = original_line
 
-    # 只在需要检查指针时执行指针检查
-    if check_pointer:
-        pointer_definitions = find_pointer_definitions(filepath)
-        display_pointer_definitions(filepath, pointer_definitions)
+        # 创建新行（应用所有替换）
+        new_line = original_line
+        # 从后向前替换，避免位置偏移
+        for pre, original, post, dest, start, end in sorted(line_replacements, key=lambda x: x[4], reverse=True):
+            new_line = new_line[:start] + dest + new_line[end:]
 
-    # 实际替换阶段
-    if apply_changes and total_replacements > 0:
-        modified, modified_lines = apply_replacements(original_lines, swaps)
+        # 写入日志文件
+        log_file.write(f"{prefix}{old_line.strip()}\n")
+        log_file.write(f"{' ' * (len(prefix) - 12)}→  {new_line.strip()}\n\n")
 
-        if modified:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.writelines(modified_lines)
+def process_matching_files(target_files, swaps, apply_changes, file_number=None, exclude_heading=None, exclude_pattern=None, check_pointer=False):
+    """处理所有匹配的文件"""
+    total = 0
+    processed_files = 0
+    current_file_index = 0
 
-    return total_replacements
+    # 创建日志文件
+    log_file = None
+    if apply_changes:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"SwapLog_{timestamp}.txt"
+        log_file = open(log_filename, 'w', encoding='utf-8')
+        log_file.write(f"替换操作日志 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log_file.write(f"{'='*80}\n\n")
+
+    try:
+        # 处理文件列表
+        for filepath in target_files:
+            current_file_index += 1
+            # 如果指定了文件序号且当前文件不是目标文件，则跳过
+            if file_number is not None and current_file_index != file_number:
+                continue
+
+            abs_path = os.path.abspath(filepath)
+            separator = "-" * 120
+            print(f"{YELLOW}{separator}{RESET}")
+            print(f"{YELLOW}处理文件 [{current_file_index}]: {abs_path}{RESET}")
+            print(f"{YELLOW}{separator}{RESET}")
+
+            # 读取文件内容
+            with open(filepath, 'r', encoding='utf-8') as f:
+                original_lines = f.readlines()
+
+            # 收集替换位置
+            replacements_by_line, count = collect_replacements(original_lines, swaps, exclude_heading, exclude_pattern)
+            total += count
+            processed_files += 1
+
+            # 显示替换位置
+            display_replacements(filepath, replacements_by_line)
+
+            # 如果没有找到替换项目，显示提示信息
+            if count == 0:
+                print(f"{GRAY}没有查找到可替换项目{RESET}")
+
+            # 只在需要检查指针时执行指针检查
+            if check_pointer:
+                pointer_definitions = find_pointer_definitions(filepath)
+                display_pointer_definitions(filepath, pointer_definitions)
+
+            # 实际替换阶段
+            if apply_changes and count > 0:
+                modified, modified_lines = apply_replacements(original_lines, swaps)
+
+                if modified:
+                    # 记录修改到日志文件
+                    if log_file:
+                        log_changes(filepath, replacements_by_line, original_lines, log_file)
+
+                    # 写入修改后的内容
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.writelines(modified_lines)
+
+            # 如果指定了文件序号且已处理完目标文件，则提前结束
+            if file_number is not None and current_file_index == file_number:
+                break
+
+    finally:
+        # 在日志文件末尾添加替换总数
+        if log_file:
+            log_file.write(f"\n{'='*80}\n")
+            log_file.write(f"替换总数: {total}\n")
+            log_file.write(f"处理文件数: {processed_files}\n")
+            log_file.write(f"{'='*80}\n")
+            log_file.close()
+            print(f"\n{GREEN}修改日志已保存到: {log_filename}{RESET}")
+
+    return total, processed_files
 
 # 显示配置信息并根据配置模式决定是否继续执行
 def show_configuration(folders, files, exclude_files, swaps, show_cfg, exclude_heading, exclude_pattern):
@@ -789,36 +867,6 @@ def collect_target_files(folders, files, exclude_files):
     print(f"{CYAN}======================{RESET}\n")
 
     return matched_files
-
-# 查找并处理匹配文件
-def process_matching_files(target_files, swaps, apply_changes, file_number=None, exclude_heading=None, exclude_pattern=None, check_pointer=False):
-    """处理所有匹配的文件"""
-    total = 0
-    processed_files = 0
-    current_file_index = 0
-
-    # 处理文件列表
-    for filepath in target_files:
-        current_file_index += 1
-        # 如果指定了文件序号且当前文件不是目标文件，则跳过
-        if file_number is not None and current_file_index != file_number:
-            continue
-
-        abs_path = os.path.abspath(filepath)
-        separator = "-" * 120
-        print(f"{YELLOW}{separator}{RESET}")
-        print(f"{YELLOW}处理文件 [{current_file_index}]: {abs_path}{RESET}")
-        print(f"{YELLOW}{separator}{RESET}")
-
-        count = process_single_file(filepath, swaps, apply_changes, exclude_heading, exclude_pattern, check_pointer)
-        total += count
-        processed_files += 1
-
-        # 如果指定了文件序号且已处理完目标文件，则提前结束
-        if file_number is not None and current_file_index == file_number:
-            return total, processed_files
-
-    return total, processed_files
 
 # 显示处理结果
 def display_results(total, processed_files, apply_changes):
