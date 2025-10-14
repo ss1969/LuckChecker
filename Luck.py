@@ -493,6 +493,11 @@ def collect_replacements(original_lines, swaps, exclude_heading, exclude_pattern
             for match in pattern.finditer(orig_line):
                 start, end = match.start(), match.end()
 
+                # 检查匹配位置是否在字符串内（前后都有奇数个分号）
+                before_quotes = orig_line[:start].count('"')
+                after_quotes = orig_line[end:].count('"') 
+                if before_quotes % 2 == 1 and after_quotes % 2 == 1:
+                    continue
 
                 # 如果这个替换位置在排除前置标记之后，则跳过
                 if exclude_heading_pos != -1 and start > exclude_heading_pos:
